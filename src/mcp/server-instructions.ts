@@ -42,6 +42,7 @@ of calls; a grep/read exploration is dozens.
 - **"What does this call?"** → \`codegraph_callees\`
 - **"What would changing this break?"** → \`codegraph_impact\`
 - **"Show me this symbol's source / signature / docstring."** → \`codegraph_node\`
+- **"How does A reach B? / trace the flow from X to Y."** → \`codegraph_path\` (shortest call/reference chain, checks both directions; replaces chained callers/callees calls)
 - **"Show me several related symbols' source / survey an area."** → \`codegraph_explore\` (ONE capped call; prefer over many codegraph_node/Read)
 - **"What's in directory X?"** → \`codegraph_files\`
 - **"Is the index ready / what's its size?"** → \`codegraph_status\`

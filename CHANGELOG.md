@@ -10,6 +10,11 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **`codegraph_path` MCP tool**: ask "how does A reach B?" and get the shortest
+  chain of calls/references between two symbols, one hop per line with
+  `file:line` and edge kind. If nothing connects A to B it checks B to A, so you
+  learn which way the flow runs. Replaces chains of `codegraph_callees` calls
+  when tracing a flow.
 - **Lua**: CodeGraph now indexes Lua (`.lua`) — functions, methods (table `t.f`
   and `t:m` definitions become methods with a `t::f` receiver-qualified name),
   local variables, `require(...)` imports, and the call edges between them.
@@ -22,6 +27,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   imports.
 
 ### Fixed
+- **Claude Code permission prompts for `codegraph_explore` and `codegraph_files`**:
+  `codegraph install` now pre-approves these (and the new `codegraph_path`) in
+  Claude's `settings.json`. Re-run `codegraph install` to pick them up.
 - **Installer**: re-running `codegraph install` now removes the broken
   auto-sync hooks that pre-0.8 versions wrote to Claude Code's
   `settings.json`. Those builds added a `Stop → codegraph sync-if-dirty`

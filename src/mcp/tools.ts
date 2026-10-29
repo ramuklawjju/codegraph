@@ -5,13 +5,22 @@
  */
 
 import CodeGraph, { findNearestCodeGraphRoot } from '../index';
-import type { Node, Edge, SearchResult, Subgraph, TaskContext, NodeKind } from '../types';
+import type { Node, Edge, SearchResult, Subgraph, TaskContext, NodeKind, EdgeKind } from '../types';
 import { createHash } from 'crypto';
 import { writeFileSync, readFileSync, existsSync } from 'fs';
 import { clamp, validatePathWithinRoot } from '../utils';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { WASM_FALLBACK_FIX_RECIPE } from '../db';
+
+/** Edge kinds `codegraph_path` follows by default (structural `contains`/`imports` excluded: they make everything look connected). */
+const DEFAULT_PATH_EDGE_KINDS: EdgeKind[] = ['calls', 'instantiates', 'references', 'extends', 'implements', 'overrides'];
+const PATH_EDGE_KINDS = new Set<EdgeKind>([
+  'contains', 'calls', 'imports', 'exports', 'extends', 'implements', 'references',
+  'type_of', 'returns', 'instantiates', 'overrides', 'decorates',
+]);
+/** Cap on same-named endpoint candidates per side, bounding BFS runs to N*N. */
+const MAX_PATH_ENDPOINTS = 5;
 
 /** Maximum output length to prevent context bloat (characters) */
 const MAX_OUTPUT_LENGTH = 15000;
@@ -216,6 +225,7 @@ interface PropertySchema {
   description: string;
   enum?: string[];
   default?: unknown;
+  items?: { type: string };
 }
 
 /**
@@ -354,6 +364,30 @@ export const tools: ToolDefinition[] = [
         projectPath: projectPathProperty,
       },
       required: ['symbol'],
+    },
+  },
+  {
+    name: 'codegraph_path',
+    description: 'Find the shortest chain of calls/references connecting two symbols ("how does A reach B?"). Returns each hop with file:line and the edge kind. Checks both directions, so you learn whether A leads to B or B leads to A. Use this instead of chaining several codegraph_callees/codegraph_callers calls to trace a flow.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        from: {
+          type: 'string',
+          description: 'Starting symbol name (e.g., "handleLogin", "AuthService.login")',
+        },
+        to: {
+          type: 'string',
+          description: 'Target symbol name (e.g., "insertUser", "db.query")',
+        },
+        edgeKinds: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Edge kinds to follow (default: calls, instantiates, references, extends, implements, overrides)',
+        },
+        projectPath: projectPathProperty,
+      },
+      required: ['from', 'to'],
     },
   },
   {
@@ -597,6 +631,8 @@ export class ToolHandler {
           return await this.handleImpact(args);
         case 'codegraph_explore':
           return await this.handleExplore(args);
+        case 'codegraph_path':
+          return await this.handlePath(args);
         case 'codegraph_node':
           return await this.handleNode(args);
         case 'codegraph_status':
@@ -735,6 +771,69 @@ export class ToolHandler {
 
     const formatted = this.formatNodeList(allCallers.slice(0, limit), `Callers of ${symbol}`) + allMatches.note;
     return this.textResult(this.truncateOutput(formatted));
+  }
+
+  /**
+   * Handle codegraph_path
+   *
+   * Tries every (from, to) pair among same-named matches (capped) and keeps
+   * the shortest path. If nothing connects from -> to, the reverse direction
+   * is checked so the agent learns the flow runs the other way.
+   */
+  private async handlePath(args: Record<string, unknown>): Promise<ToolResult> {
+    const from = this.validateString(args.from, 'from');
+    if (typeof from !== 'string') return from;
+    const to = this.validateString(args.to, 'to');
+    if (typeof to !== 'string') return to;
+
+    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+
+    const requested = Array.isArray(args.edgeKinds)
+      ? (args.edgeKinds as unknown[]).filter((k): k is EdgeKind => typeof k === 'string' && PATH_EDGE_KINDS.has(k as EdgeKind))
+      : [];
+    const edgeKinds = requested.length > 0 ? requested : DEFAULT_PATH_EDGE_KINDS;
+
+    const fromMatches = this.findAllSymbols(cg, from).nodes.slice(0, MAX_PATH_ENDPOINTS);
+    if (fromMatches.length === 0) return this.textResult(`Symbol "${from}" not found in the codebase`);
+    const toMatches = this.findAllSymbols(cg, to).nodes.slice(0, MAX_PATH_ENDPOINTS);
+    if (toMatches.length === 0) return this.textResult(`Symbol "${to}" not found in the codebase`);
+
+    const shortest = (sources: Node[], targets: Node[]) => {
+      let best: Array<{ node: Node; edge: Edge | null }> | null = null;
+      for (const s of sources) {
+        for (const t of targets) {
+          if (s.id === t.id) continue;
+          const p = cg.findPath(s.id, t.id, edgeKinds);
+          if (p && (!best || p.length < best.length)) best = p;
+        }
+      }
+      return best;
+    };
+
+    const forward = shortest(fromMatches, toMatches);
+    if (forward) {
+      return this.textResult(this.truncateOutput(this.formatPath(forward, `Path: ${from} -> ${to}`)));
+    }
+    const reverse = shortest(toMatches, fromMatches);
+    if (reverse) {
+      return this.textResult(this.truncateOutput(
+        `No path from "${from}" to "${to}", but the reverse direction connects:\n\n` +
+        this.formatPath(reverse, `Path: ${to} -> ${from}`)
+      ));
+    }
+    return this.textResult(
+      `No path between "${from}" and "${to}" in either direction (edge kinds: ${edgeKinds.join(', ')}). ` +
+      `They may be connected only through dynamic dispatch, config, or code outside the index.`
+    );
+  }
+
+  private formatPath(path: Array<{ node: Node; edge: Edge | null }>, title: string): string {
+    const lines: string[] = [`## ${title} (${path.length - 1} hop${path.length === 2 ? '' : 's'})`, ''];
+    path.forEach((step, i) => {
+      const via = step.edge ? ` <- ${step.edge.kind}${step.edge.line ? ` at line ${step.edge.line}` : ''}` : '';
+      lines.push(`${i + 1}. ${step.node.name} (${step.node.kind}) - ${step.node.filePath}:${step.node.startLine}${via}`);
+    });
+    return lines.join('\n');
   }
 
   /**

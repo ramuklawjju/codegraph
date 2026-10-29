@@ -36,6 +36,7 @@ Use codegraph for **structural** questions — what calls what, what would break
 | "What does Y call?" | \`codegraph_callees\` |
 | "What would break if I changed Z?" | \`codegraph_impact\` |
 | "Show me Y's signature / source / docstring" | \`codegraph_node\` |
+| "How does A reach B?" / trace a flow | \`codegraph_path\` |
 | "Give me focused context for a task/area" | \`codegraph_context\` |
 | "See several related symbols' source at once" | \`codegraph_explore\` |
 | "What files exist under path/" | \`codegraph_files\` |
