@@ -485,6 +485,22 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(after.permissions?.allow).toContain('mcp__codegraph__codegraph_search');
   });
 
+  it('claude: re-install adds newly introduced tool permissions to an older allowlist', () => {
+    const claude = getTarget('claude')!;
+    const file = seedSettings('global', {
+      permissions: { allow: ['Bash(ls)', 'mcp__codegraph__codegraph_search'] },
+    });
+
+    claude.install('global', { autoAllow: true });
+
+    const allow = JSON.parse(fs.readFileSync(file, 'utf-8')).permissions.allow;
+    expect(allow).toContain('Bash(ls)');
+    for (const tool of ['codegraph_path', 'codegraph_explore', 'codegraph_files']) {
+      expect(allow).toContain(`mcp__codegraph__${tool}`);
+    }
+    expect(allow.filter((p: string) => p === 'mcp__codegraph__codegraph_search')).toHaveLength(1);
+  });
+
   it('claude: cleanupLegacyHooks preserves a sibling hook sharing our matcher group', () => {
     const file = seedSettings('global', {
       hooks: {

@@ -5,13 +5,34 @@
  */
 
 import CodeGraph, { findNearestCodeGraphRoot } from '../index';
-import type { Node, Edge, SearchResult, Subgraph, TaskContext, NodeKind } from '../types';
+import type { Node, Edge, SearchResult, Subgraph, TaskContext, NodeKind, EdgeKind } from '../types';
 import { createHash } from 'crypto';
 import { writeFileSync, readFileSync, existsSync } from 'fs';
 import { clamp, validatePathWithinRoot } from '../utils';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { WASM_FALLBACK_FIX_RECIPE } from '../db';
+
+/** Edge kinds `codegraph_path` follows by default (structural `contains`/`imports` excluded: they make everything look connected). */
+const DEFAULT_PATH_EDGE_KINDS: EdgeKind[] = ['calls', 'instantiates', 'references', 'extends', 'implements', 'overrides'];
+const PATH_EDGE_KINDS = new Set<EdgeKind>([
+  'contains', 'calls', 'imports', 'exports', 'extends', 'implements', 'references',
+  'type_of', 'returns', 'instantiates', 'overrides', 'decorates',
+]);
+const DEAD_CODE_KINDS = new Set<NodeKind>([
+  'function', 'method', 'class', 'struct', 'interface', 'trait', 'protocol',
+  'enum', 'type_alias', 'variable', 'constant', 'property', 'field',
+]);
+
+/** Normalize a directory filter (`./src/`, `src`) to a `src/` prefix, or null. */
+function normalizeDirFilter(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim().replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
+  return trimmed && trimmed !== '.' ? `${trimmed}/` : null;
+}
+
+/** Cap on same-named endpoint candidates per side, bounding BFS runs to N*N. */
+const MAX_PATH_ENDPOINTS = 5;
 
 /** Maximum output length to prevent context bloat (characters) */
 const MAX_OUTPUT_LENGTH = 15000;
@@ -216,6 +237,7 @@ interface PropertySchema {
   description: string;
   enum?: string[];
   default?: unknown;
+  items?: { type: string };
 }
 
 /**
@@ -354,6 +376,73 @@ export const tools: ToolDefinition[] = [
         projectPath: projectPathProperty,
       },
       required: ['symbol'],
+    },
+  },
+  {
+    name: 'codegraph_path',
+    description: 'Find the shortest chain of calls/references connecting two symbols ("how does A reach B?"). Returns each hop with file:line and the edge kind. Checks both directions, so you learn whether A leads to B or B leads to A. Use this instead of chaining several codegraph_callees/codegraph_callers calls to trace a flow.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        from: {
+          type: 'string',
+          description: 'Starting symbol name (e.g., "handleLogin", "AuthService.login")',
+        },
+        to: {
+          type: 'string',
+          description: 'Target symbol name (e.g., "insertUser", "db.query")',
+        },
+        edgeKinds: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Edge kinds to follow (default: calls, instantiates, references, extends, implements, overrides)',
+        },
+        projectPath: projectPathProperty,
+      },
+      required: ['from', 'to'],
+    },
+  },
+  {
+    name: 'codegraph_dead_code',
+    description: 'List functions/methods/classes that nothing in the index refers to — candidates for deletion during cleanup. Skips exported symbols, public members of exported types, decorated symbols, overrides, entry points, and test files. Results are candidates, not proof: reflection, dynamic dispatch, and string-based lookups are invisible to static analysis.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'Only report symbols in files under this directory (e.g., "src/utils")',
+        },
+        kinds: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Node kinds to check (default: function, method, class)',
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum number of symbols to return (default: 50)',
+          default: 50,
+        },
+        projectPath: projectPathProperty,
+      },
+    },
+  },
+  {
+    name: 'codegraph_cycles',
+    description: 'Find circular file dependencies. Each result is a group of files that depend on each other through a cycle of imports/calls/references. Use before refactoring module boundaries or when chasing import-order bugs.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'Only report cycles that include a file under this directory',
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum number of cycles to return (default: 20)',
+          default: 20,
+        },
+        projectPath: projectPathProperty,
+      },
     },
   },
   {
@@ -597,6 +686,12 @@ export class ToolHandler {
           return await this.handleImpact(args);
         case 'codegraph_explore':
           return await this.handleExplore(args);
+        case 'codegraph_path':
+          return await this.handlePath(args);
+        case 'codegraph_dead_code':
+          return await this.handleDeadCode(args);
+        case 'codegraph_cycles':
+          return await this.handleCycles(args);
         case 'codegraph_node':
           return await this.handleNode(args);
         case 'codegraph_status':
@@ -735,6 +830,118 @@ export class ToolHandler {
 
     const formatted = this.formatNodeList(allCallers.slice(0, limit), `Callers of ${symbol}`) + allMatches.note;
     return this.textResult(this.truncateOutput(formatted));
+  }
+
+  /**
+   * Handle codegraph_path
+   *
+   * Tries every (from, to) pair among same-named matches (capped) and keeps
+   * the shortest path. If nothing connects from -> to, the reverse direction
+   * is checked so the agent learns the flow runs the other way.
+   */
+  private async handlePath(args: Record<string, unknown>): Promise<ToolResult> {
+    const from = this.validateString(args.from, 'from');
+    if (typeof from !== 'string') return from;
+    const to = this.validateString(args.to, 'to');
+    if (typeof to !== 'string') return to;
+
+    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+
+    const requested = Array.isArray(args.edgeKinds)
+      ? (args.edgeKinds as unknown[]).filter((k): k is EdgeKind => typeof k === 'string' && PATH_EDGE_KINDS.has(k as EdgeKind))
+      : [];
+    const edgeKinds = requested.length > 0 ? requested : DEFAULT_PATH_EDGE_KINDS;
+
+    const fromMatches = this.findAllSymbols(cg, from).nodes.slice(0, MAX_PATH_ENDPOINTS);
+    if (fromMatches.length === 0) return this.textResult(`Symbol "${from}" not found in the codebase`);
+    const toMatches = this.findAllSymbols(cg, to).nodes.slice(0, MAX_PATH_ENDPOINTS);
+    if (toMatches.length === 0) return this.textResult(`Symbol "${to}" not found in the codebase`);
+
+    const shortest = (sources: Node[], targets: Node[]) => {
+      let best: Array<{ node: Node; edge: Edge | null }> | null = null;
+      for (const s of sources) {
+        for (const t of targets) {
+          if (s.id === t.id) continue;
+          const p = cg.findPath(s.id, t.id, edgeKinds);
+          if (p && (!best || p.length < best.length)) best = p;
+        }
+      }
+      return best;
+    };
+
+    const forward = shortest(fromMatches, toMatches);
+    if (forward) {
+      return this.textResult(this.truncateOutput(this.formatPath(forward, `Path: ${from} -> ${to}`)));
+    }
+    const reverse = shortest(toMatches, fromMatches);
+    if (reverse) {
+      return this.textResult(this.truncateOutput(
+        `No path from "${from}" to "${to}", but the reverse direction connects:\n\n` +
+        this.formatPath(reverse, `Path: ${to} -> ${from}`)
+      ));
+    }
+    return this.textResult(
+      `No path between "${from}" and "${to}" in either direction (edge kinds: ${edgeKinds.join(', ')}). ` +
+      `They may be connected only through dynamic dispatch, config, or code outside the index.`
+    );
+  }
+
+  /**
+   * Handle codegraph_dead_code
+   */
+  private async handleDeadCode(args: Record<string, unknown>): Promise<ToolResult> {
+    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const limit = clamp((args.limit as number) || 50, 1, 500);
+    const prefix = normalizeDirFilter(args.path);
+    const kinds = Array.isArray(args.kinds)
+      ? (args.kinds as unknown[]).filter((k): k is NodeKind => typeof k === 'string' && DEAD_CODE_KINDS.has(k as NodeKind))
+      : [];
+
+    const dead = cg
+      .findDeadCode(kinds.length > 0 ? kinds : undefined)
+      .filter((n) => !prefix || n.filePath.startsWith(prefix))
+      .sort((a, b) => a.filePath.localeCompare(b.filePath) || a.startLine - b.startLine);
+
+    if (dead.length === 0) {
+      return this.textResult(`No unreferenced symbols found${prefix ? ` under ${prefix}` : ''}.`);
+    }
+    const lines = [`## Unreferenced symbols (${dead.length} found${dead.length > limit ? `, showing ${limit}` : ''})`, ''];
+    for (const n of dead.slice(0, limit)) {
+      lines.push(`- ${n.name} (${n.kind}) - ${n.filePath}:${n.startLine}`);
+    }
+    lines.push('', '> Candidates only: confirm before deleting if the code may be reached by reflection, dynamic dispatch, or string lookup.');
+    return this.textResult(this.truncateOutput(lines.join('\n')));
+  }
+
+  /**
+   * Handle codegraph_cycles
+   */
+  private async handleCycles(args: Record<string, unknown>): Promise<ToolResult> {
+    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const limit = clamp((args.limit as number) || 20, 1, 200);
+    const prefix = normalizeDirFilter(args.path);
+
+    const cycles = cg
+      .findCircularDependencies()
+      .filter((c) => !prefix || c.some((f) => f.startsWith(prefix)));
+
+    if (cycles.length === 0) {
+      return this.textResult(`No circular file dependencies found${prefix ? ` involving ${prefix}` : ''}.`);
+    }
+    const lines = [`## Circular dependencies (${cycles.length} group${cycles.length === 1 ? '' : 's'})`, ''];
+    cycles.slice(0, limit).forEach((group, i) => {
+      lines.push(`${i + 1}. ${group.length} files: ${group.join(', ')}`);
+    });
+    return this.textResult(this.truncateOutput(lines.join('\n')));
+  }
+
+  private formatPath(path: Array<{ node: Node; edge: Edge | null }>, title: string): string {
+    const lines: string[] = [`## ${title} (${path.length - 1} hop${path.length === 2 ? '' : 's'})`, ''];
+    path.forEach((step, i) => {
+      const via = step.edge ? ` <- ${step.edge.kind}${step.edge.line ? ` at line ${step.edge.line}` : ''}` : '';
+      lines.push(`${i + 1}. ${step.node.name} (${step.node.kind}) - ${step.node.filePath}:${step.node.startLine}${via}`);
+    });
+    return lines.join('\n');
   }
 
   /**

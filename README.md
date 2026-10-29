@@ -214,7 +214,12 @@ npm install -g @colbymchenry/codegraph
       "mcp__codegraph__codegraph_callers",
       "mcp__codegraph__codegraph_callees",
       "mcp__codegraph__codegraph_impact",
+      "mcp__codegraph__codegraph_path",
       "mcp__codegraph__codegraph_node",
+      "mcp__codegraph__codegraph_explore",
+      "mcp__codegraph__codegraph_files",
+      "mcp__codegraph__codegraph_dead_code",
+      "mcp__codegraph__codegraph_cycles",
       "mcp__codegraph__codegraph_status",
       "mcp__codegraph__codegraph_files"
     ]
@@ -253,6 +258,8 @@ CodeGraph builds a semantic knowledge graph of codebases for faster, smarter cod
 |------|---------|
 | `codegraph_search` | Find symbols by name |
 | `codegraph_callers` / `codegraph_callees` | Trace call flow |
+| `codegraph_path` | How does A reach B? |
+| `codegraph_dead_code` / `codegraph_cycles` | Cleanup and refactoring checks |
 | `codegraph_impact` | Check what's affected before editing |
 | `codegraph_node` | Get a single symbol's details |
 
@@ -325,6 +332,9 @@ codegraph query <search>          # Search symbols (--kind, --limit, --json)
 codegraph files [path]            # Show file structure (--format, --filter, --max-depth, --json)
 codegraph context <task>          # Build context for AI (--format, --max-nodes)
 codegraph affected [files...]     # Find test files affected by changes (see below)
+codegraph path <from> <to>        # Shortest call/reference chain between two symbols (--edges)
+codegraph dead-code               # Unreferenced functions/methods/classes (--dir, --kinds, --limit)
+codegraph cycles                  # Circular file dependencies (--dir, --limit)
 codegraph serve --mcp             # Start MCP server
 ```
 
@@ -368,6 +378,9 @@ When running as an MCP server, CodeGraph exposes these tools to Claude Code:
 | `codegraph_context` | Build relevant code context for a task |
 | `codegraph_callers` | Find what calls a function |
 | `codegraph_callees` | Find what a function calls |
+| `codegraph_path` | Shortest call/reference chain between two symbols (checks both directions) |
+| `codegraph_dead_code` | List functions/methods/classes nothing refers to (cleanup candidates) |
+| `codegraph_cycles` | Find groups of files that depend on each other in a cycle |
 | `codegraph_impact` | Analyze what code is affected by changing a symbol |
 | `codegraph_node` | Get details about a specific symbol (optionally with source code) |
 | `codegraph_files` | Get indexed file structure (faster than filesystem scanning) |

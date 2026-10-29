@@ -1048,6 +1048,60 @@ export class QueryBuilder {
   }
 
   /**
+   * Files that `filePath` depends on: the files holding the target of any
+   * non-containment edge whose source is in `filePath`. Resolved imports are
+   * stored as `calls`/`references`/... edges to the imported symbol, so file
+   * dependencies have to be read from every edge kind, not just `imports`.
+   */
+  getFileDependencyPaths(filePath: string): string[] {
+    const rows = this.db.prepare(
+      `SELECT DISTINCT t.file_path AS p FROM nodes s
+       JOIN edges e ON e.source = s.id
+       JOIN nodes t ON t.id = e.target
+       WHERE s.file_path = ? AND t.file_path <> ? AND e.kind <> 'contains'`
+    ).all(filePath, filePath) as Array<{ p: string }>;
+    return rows.map((r) => r.p);
+  }
+
+  /** Files that depend on `filePath` (reverse of `getFileDependencyPaths`). */
+  getFileDependentPaths(filePath: string): string[] {
+    const rows = this.db.prepare(
+      `SELECT DISTINCT s.file_path AS p FROM nodes t
+       JOIN edges e ON e.target = t.id
+       JOIN nodes s ON s.id = e.source
+       WHERE t.file_path = ? AND s.file_path <> ? AND e.kind <> 'contains'`
+    ).all(filePath, filePath) as Array<{ p: string }>;
+    return rows.map((r) => r.p);
+  }
+
+  /** Every import node's module specifier, for file-level import resolution. */
+  getImportSpecifiers(): Array<{ filePath: string; name: string; language: Language }> {
+    return this.db.prepare(
+      `SELECT file_path AS filePath, name, language FROM nodes WHERE kind = 'import'`
+    ).all() as Array<{ filePath: string; name: string; language: Language }>;
+  }
+
+  /** Cheap fingerprint that changes whenever import nodes or files change. */
+  getImportFingerprint(): string {
+    const row = this.db.prepare(
+      `SELECT (SELECT COUNT(*) FROM nodes WHERE kind = 'import') AS n,
+              (SELECT MAX(updated_at) FROM nodes WHERE kind = 'import') AS u,
+              (SELECT COUNT(*) FROM files) AS f`
+    ).get() as { n: number; u: number | null; f: number };
+    return `${row.n}:${row.u ?? 0}:${row.f}`;
+  }
+
+  /** Every distinct (from file, to file) dependency pair in one pass. */
+  getAllFileDependencyPairs(): Array<{ from: string; to: string }> {
+    return this.db.prepare(
+      `SELECT DISTINCT s.file_path AS "from", t.file_path AS "to" FROM edges e
+       JOIN nodes s ON s.id = e.source
+       JOIN nodes t ON t.id = e.target
+       WHERE s.file_path <> t.file_path AND e.kind <> 'contains'`
+    ).all() as Array<{ from: string; to: string }>;
+  }
+
+  /**
    * Find all edges where both source and target are in the given node set.
    * Useful for recovering inter-node connectivity after BFS.
    */

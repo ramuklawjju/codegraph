@@ -6,6 +6,7 @@
  */
 
 import * as path from 'path';
+import * as fs from 'fs';
 import {
   CodeGraphConfig,
   Node,
@@ -47,7 +48,7 @@ import {
 } from './resolution';
 import { GraphTraverser, GraphQueryManager } from './graph';
 import { ContextBuilder, createContextBuilder } from './context';
-import { Mutex, FileLock } from './utils';
+import { Mutex, FileLock, validatePathWithinRoot } from './utils';
 import { FileWatcher, WatchOptions } from './sync';
 
 // Re-export types for consumers
@@ -161,6 +162,10 @@ export class CodeGraph {
     this.orchestrator = new ExtractionOrchestrator(projectRoot, config, queries);
     this.resolver = createResolver(projectRoot, queries);
     this.graphManager = new GraphQueryManager(queries);
+    this.graphManager.setImportResolver({
+      resolve: (specifier, fromFile, language) => this.resolver.resolveImportedFile(specifier, fromFile, language),
+      reExportSpecifiers: (filePath, language) => this.resolver.getReExportSpecifiers(filePath, language),
+    });
     this.traverser = new GraphTraverser(queries);
     this.contextBuilder = createContextBuilder(
       projectRoot,
@@ -856,7 +861,7 @@ export class CodeGraph {
   /**
    * Find circular dependencies in the codebase
    *
-   * @returns Array of cycles, each cycle is an array of file paths
+   * @returns Groups of files that depend on each other in a cycle (each file appears once)
    */
   findCircularDependencies(): string[][] {
     return this.graphManager.findCircularDependencies();
@@ -869,7 +874,14 @@ export class CodeGraph {
    * @returns Array of unreferenced nodes
    */
   findDeadCode(kinds?: Node['kind'][]): Node[] {
-    return this.graphManager.findDeadCode(kinds);
+    return this.graphManager.findDeadCode(kinds, (filePath) => {
+      try {
+        const full = validatePathWithinRoot(this.projectRoot, filePath);
+        return full ? fs.readFileSync(full, 'utf-8') : null;
+      } catch {
+        return null;
+      }
+    });
   }
 
   /**
