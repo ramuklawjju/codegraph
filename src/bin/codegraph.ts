@@ -843,6 +843,91 @@ program
   });
 
 /**
+ * Run an MCP tool handler against a local project and print its text output.
+ * Keeps graph-analysis CLI commands and their MCP tools in lockstep.
+ */
+async function runGraphTool(
+  toolName: string,
+  args: Record<string, unknown>,
+  projectPathOption: string | undefined,
+  failureLabel: string
+): Promise<void> {
+  const projectPath = resolveProjectPath(projectPathOption);
+  try {
+    if (!isInitialized(projectPath)) {
+      error(`CodeGraph not initialized in ${projectPath}`);
+      process.exit(1);
+    }
+    const { default: CodeGraph } = await loadCodeGraph();
+    const { ToolHandler } = await import('../mcp/tools');
+    const cg = await CodeGraph.open(projectPath);
+    const result = await new ToolHandler(cg).execute(toolName, args);
+    const text = result.content.map((c) => c.text).join('\n');
+    if (result.isError) {
+      error(text);
+      cg.destroy();
+      process.exit(1);
+    }
+    console.log(text);
+    cg.destroy();
+  } catch (err) {
+    error(`${failureLabel} failed: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+}
+
+/**
+ * codegraph path <from> <to>
+ */
+program
+  .command('path <from> <to>')
+  .description('Show the shortest call/reference chain between two symbols')
+  .option('-p, --path <path>', 'Project path')
+  .option('-e, --edges <kinds>', 'Comma-separated edge kinds to follow (default: calls,instantiates,references,extends,implements,overrides)')
+  .action(async (from: string, to: string, options: { path?: string; edges?: string }) => {
+    const edgeKinds = options.edges ? options.edges.split(',').map((k) => k.trim()).filter(Boolean) : undefined;
+    await runGraphTool('codegraph_path', { from, to, edgeKinds }, options.path, 'Path lookup');
+  });
+
+/**
+ * codegraph dead-code
+ */
+program
+  .command('dead-code')
+  .description('List functions, methods, and classes nothing in the index refers to')
+  .option('-p, --path <path>', 'Project path')
+  .option('-d, --dir <dir>', 'Only report symbols under this directory')
+  .option('-k, --kinds <kinds>', 'Comma-separated node kinds (default: function,method,class)')
+  .option('-l, --limit <number>', 'Maximum results', '50')
+  .action(async (options: { path?: string; dir?: string; kinds?: string; limit?: string }) => {
+    const kinds = options.kinds ? options.kinds.split(',').map((k) => k.trim()).filter(Boolean) : undefined;
+    await runGraphTool(
+      'codegraph_dead_code',
+      { path: options.dir, kinds, limit: parseInt(options.limit || '50', 10) },
+      options.path,
+      'Dead code analysis'
+    );
+  });
+
+/**
+ * codegraph cycles
+ */
+program
+  .command('cycles')
+  .description('Find circular file dependencies')
+  .option('-p, --path <path>', 'Project path')
+  .option('-d, --dir <dir>', 'Only report cycles that include a file under this directory')
+  .option('-l, --limit <number>', 'Maximum results', '20')
+  .action(async (options: { path?: string; dir?: string; limit?: string }) => {
+    await runGraphTool(
+      'codegraph_cycles',
+      { path: options.dir, limit: parseInt(options.limit || '20', 10) },
+      options.path,
+      'Cycle detection'
+    );
+  });
+
+/**
  * codegraph files [path]
  */
 program
@@ -1145,6 +1230,8 @@ program
         console.error(chalk.cyan('  codegraph_path') + '      - Trace how one symbol reaches another');
         console.error(chalk.cyan('  codegraph_node') + '      - Get symbol details');
         console.error(chalk.cyan('  codegraph_explore') + '   - Source for several related symbols');
+        console.error(chalk.cyan('  codegraph_dead_code') + ' - Find unreferenced symbols');
+        console.error(chalk.cyan('  codegraph_cycles') + '    - Find circular file dependencies');
         console.error(chalk.cyan('  codegraph_files') + '     - Get project file structure');
         console.error(chalk.cyan('  codegraph_status') + '    - Get index status');
       }

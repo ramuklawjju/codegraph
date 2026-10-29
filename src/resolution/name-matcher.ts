@@ -6,6 +6,7 @@
 
 import { Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext } from './types';
+import { resolveImportPath } from './import-resolver';
 
 /**
  * Try to resolve a path-like reference (e.g., "snippets/drawer-menu.liquid")
@@ -191,6 +192,41 @@ export function matchMethodCall(
     }
   }
 
+  // Strategy 1b: Declared type of the receiver variable. Reads the source
+  // above the call for `cg: CodeGraph`, `cg = new CodeGraph(`, `CodeGraph cg`,
+  // or `cg = this.getCodeGraph(` (then uses that function's return type).
+  // Without this, `cg.findPath()` on a variable whose name shares no words
+  // with its class never resolves when several classes define `findPath`.
+  const declaredType = inferReceiverType(objectOrClass!, ref, context);
+  if (declaredType && declaredType !== objectOrClass) {
+    const methodNode = findMethodOnType(declaredType, methodName!, ref, context);
+    if (methodNode) {
+      return {
+        original: ref,
+        targetNodeId: methodNode.id,
+        confidence: 0.85,
+        resolvedBy: 'instance-method',
+      };
+    }
+    // The receiver's type is known but declares no such method here: either
+    // a library type (`re = /x/`, `stmt: Statement`) or an interface whose
+    // implementation is chosen at runtime. Strategies 2-3 would only guess
+    // an unrelated class's method of the same name.
+    return null;
+  }
+
+  // Receiver is a module imported from outside the project (`import * as fs
+  // from 'fs'`, `import path from 'path'`): `fs.watch()` is a library call.
+  if (context.getImportMappings) {
+    const mapping = context
+      .getImportMappings(ref.filePath, ref.language)
+      .find((m) => m.localName === objectOrClass && (m.isNamespace || m.isDefault));
+    if (mapping && !mapping.resolvedPath && resolveImportPath(mapping.source, ref.filePath, ref.language, context) === null) {
+      const local = context.getNodesByName(objectOrClass!).some((n) => TYPE_KINDS.has(n.kind));
+      if (!local) return null;
+    }
+  }
+
   // Strategy 2: Instance variable receiver - try capitalized form to find class
   // e.g., "permissionEngine" → look for classes containing "PermissionEngine"
   const capitalizedReceiver = objectOrClass!.charAt(0).toUpperCase() + objectOrClass!.slice(1);
@@ -274,6 +310,109 @@ export function matchMethodCall(
     }
   }
 
+  return null;
+}
+
+/** How many lines above the call site to scan for the receiver's declaration. */
+const RECEIVER_SCAN_LINES = 400;
+
+const TYPE_KINDS = new Set(['class', 'struct', 'interface', 'trait', 'protocol']);
+
+/** Small cache of split file contents; refs arrive grouped by file. */
+const lineCache = new Map<string, { content: string; lines: string[] }>();
+const LINE_CACHE_MAX = 32;
+
+function splitLinesCached(filePath: string, content: string): string[] {
+  const hit = lineCache.get(filePath);
+  if (hit && hit.content === content) return hit.lines;
+  if (lineCache.size >= LINE_CACHE_MAX) lineCache.delete(lineCache.keys().next().value!);
+  const lines = content.split('\n');
+  lineCache.set(filePath, { content, lines });
+  return lines;
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Best-effort static type of a receiver variable, read from the source text
+ * above the call. Returns the nearest preceding declaration's type name.
+ */
+export function inferReceiverType(
+  receiver: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): string | null {
+  if (receiver === 'this' || receiver === 'self' || receiver === 'super') return null;
+  const content = context.readFile(ref.filePath);
+  if (!content) return null;
+
+  const lines = splitLinesCached(ref.filePath, content);
+  const end = Math.min(ref.line, lines.length);
+  const start = Math.max(0, end - RECEIVER_SCAN_LINES);
+  const r = escapeRegExp(receiver);
+  const T = '([A-Z][A-Za-z0-9_]*)';
+  const patterns: RegExp[] = [
+    // TS / Kotlin / Swift / Python / Rust / Scala annotation: `cg: CodeGraph`, `cg: &mut CodeGraph`
+    new RegExp(`\\b${r}\\s*[?!]?\\s*:\\s*(?:&\\s*(?:mut\\s+)?|\\*)?(?:[a-z_][\\w]*(?:::|\\.))*${T}`),
+    // Constructor: `cg = new CodeGraph(`, `cg := &CodeGraph{`, `cg = CodeGraph(`, `cg = CodeGraph::new(`
+    new RegExp(`\\b${r}\\s*(?::[^=]*)?:?=\\s*(?:new\\s+|&)?${T}\\s*(?:[({]|::new|\\.new)`),
+    // Java / C# / C++ / Dart declaration: `CodeGraph cg =`, `final CodeGraph cg;`
+    new RegExp(`\\b${T}(?:<[^>]*>)?\\s*[*&]?\\s+${r}\\s*[=;,)]`),
+  ];
+  const callPattern = new RegExp(`\\b${r}\\s*(?::[^=]*)?:?=\\s*(?:await\\s+)?(?:(?:this|self)\\.)?([a-zA-Z_]\\w*)\\s*\\(`);
+
+  const literal = new RegExp(`\\b${r}\\s*(?::[^=]*)?=\\s*(\\/[^/*]|\\[|['"\`])`);
+  for (let i = end - 1; i >= start; i--) {
+    const line = lines[i]!;
+    if (!line.includes(receiver)) continue;
+    const lit = line.match(literal);
+    if (lit && lit[1]) return lit[1].startsWith('/') ? 'RegExp' : lit[1] === '[' ? 'Array' : 'String';
+    for (const p of patterns) {
+      const m = line.match(p);
+      if (m && m[1]) return m[1];
+    }
+    const call = line.match(callPattern);
+    if (call && call[1]) {
+      const fn = context
+        .getNodesByName(call[1])
+        .find((n) => (n.kind === 'function' || n.kind === 'method') && n.language === ref.language && n.signature);
+      const ret = fn?.signature?.match(/\)\s*(?::|->)\s*(?:Promise<)?([A-Z][A-Za-z0-9_]*)/);
+      if (ret && ret[1]) return ret[1];
+      return null;
+    }
+  }
+  return null;
+}
+
+/** Find `methodName` declared on a type named `typeName` in the ref's language. */
+function findMethodOnType(
+  typeName: string,
+  methodName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): Node | null {
+  for (const typeNode of context.getNodesByName(typeName)) {
+    if (!TYPE_KINDS.has(typeNode.kind) || typeNode.language !== ref.language) continue;
+    const methodNode = context.getNodesInFile(typeNode.filePath).find(
+      (n) =>
+        (n.kind === 'method' || n.kind === 'function') &&
+        n.name === methodName &&
+        n.qualifiedName.includes(typeNode.name)
+    );
+    if (methodNode) return methodNode;
+  }
+  // Interfaces/traits often have no member nodes; an implementation that
+  // lives in the interface's own file is the likely target.
+  for (const typeNode of context.getNodesByName(typeName)) {
+    if (typeNode.kind === 'class' || typeNode.kind === 'struct' || typeNode.language !== ref.language) continue;
+    if (!TYPE_KINDS.has(typeNode.kind)) continue;
+    const impls = context
+      .getNodesInFile(typeNode.filePath)
+      .filter((n) => n.kind === 'method' && n.name === methodName);
+    if (impls.length === 1) return impls[0]!;
+  }
   return null;
 }
 
@@ -451,13 +590,70 @@ export function matchReference(
   result = matchMethodCall(ref, context);
   if (result) return result;
 
+  // A receiver whose declared type is known but not defined in this codebase
+  // (`re = /x/`, `stmt: Statement`, `m = new Map()`) is a library call: no
+  // project symbol is the target, so don't let the name-only strategies guess.
+  if (hasExternalReceiverType(ref, context)) return null;
+
   // 3. Exact name match
   result = matchByExactName(ref, context);
-  if (result) return result;
+  if (result) return rejectFreeFunctionForMemberCall(result, ref, context);
 
   // 4. Fuzzy match (lowest confidence)
   result = matchFuzzy(ref, context);
-  if (result) return result;
+  if (result) return rejectFreeFunctionForMemberCall(result, ref, context);
 
   return null;
+}
+
+function hasExternalReceiverType(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const m = ref.referenceName.match(/^(\w+)\.(\w+)$/);
+  if (!m) return false;
+  const type = inferReceiverType(m[1]!, ref, context);
+  if (!type || type === m[1]) return false;
+  return !context
+    .getNodesByName(type)
+    .some((n) => TYPE_KINDS.has(n.kind) && n.language === ref.language);
+}
+
+/** Lines after the call's start line to scan for the callee (multi-line chains). */
+const CALL_SITE_SCAN_LINES = 10;
+
+/**
+ * True when every call of `name(` near the call site is a member access
+ * (`x.y.name(`, `foo().name(`). Chained receivers are recorded with the bare
+ * method name, which otherwise looks identical to a plain `name()` call.
+ */
+function isMemberCallSite(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const content = context.readFile(ref.filePath);
+  if (!content) return false;
+  const lines = splitLinesCached(ref.filePath, content);
+  // Member access is `.`/`?.`/`->`; a dot preceded by another dot is the
+  // spread operator (`...name(`), which is a plain call.
+  const call = new RegExp(`((?:\\?|(?<!\\.))\\.|->)?\\s*\\b${escapeRegExp(name)}\\s*(?:<[^>()]*>)?\\(`, 'g');
+  let sawMember = false;
+  const last = Math.min(lines.length, ref.line + CALL_SITE_SCAN_LINES);
+  for (let i = Math.max(0, ref.line - 1); i < last; i++) {
+    for (const m of lines[i]!.matchAll(call)) {
+      if (!m[1]) return false;
+      sawMember = true;
+    }
+    if (sawMember) return true;
+  }
+  return false;
+}
+
+/**
+ * A member call on a chained/complex receiver can't target a free function:
+ * `db.prepare(sql).run()` must not resolve to some project-level `run()`.
+ */
+function rejectFreeFunctionForMemberCall(
+  result: ResolvedRef,
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): ResolvedRef | null {
+  if (ref.referenceKind !== 'calls' || /[.:]/.test(ref.referenceName)) return result;
+  const target = context.getNodesByName(ref.referenceName).find((n) => n.id === result.targetNodeId);
+  if (target?.kind !== 'function') return result;
+  return isMemberCallSite(ref.referenceName, ref, context) ? null : result;
 }

@@ -6,7 +6,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { Node, UnresolvedReference, Edge } from '../types';
+import { Node, UnresolvedReference, Edge, Language } from '../types';
 import { QueryBuilder } from '../db/queries';
 import {
   UnresolvedRef,
@@ -17,10 +17,11 @@ import {
   ImportMapping,
 } from './types';
 import { matchReference } from './name-matcher';
-import { resolveViaImport, extractImportMappings, extractReExports } from './import-resolver';
+import { resolveViaImport, extractImportMappings, extractReExports, resolveImportPath } from './import-resolver';
 import { detectFrameworks } from './frameworks';
 import { loadProjectAliases, type AliasMap } from './path-aliases';
 import { logDebug } from '../errors';
+import { validatePathWithinRoot } from '../utils';
 import type { ReExport } from './types';
 
 // Re-export types
@@ -166,6 +167,36 @@ export class ReferenceResolver {
     this.knownNames = new Set(this.queries.getAllNodeNames());
 
     this.cachesWarmed = true;
+  }
+
+  /**
+   * Resolve an import node's module specifier (`../src/index`, `@/utils`) to
+   * the project file it loads, or null for external/unresolvable imports.
+   */
+  resolveImportedFile(specifier: string, fromFile: string, language: Language): string | null {
+    try {
+      return resolveImportPath(specifier, fromFile, language, this.context);
+    } catch (error) {
+      logDebug('Failed to resolve import specifier', { specifier, fromFile, error: String(error) });
+      return null;
+    }
+  }
+
+  /**
+   * Module specifiers a file re-exports from (`export { x } from './x'`).
+   * Reads the file fresh: the graph layer only calls this when the index has
+   * changed, and the resolution caches may predate the change.
+   */
+  getReExportSpecifiers(filePath: string, language: Language): string[] {
+    const fullPath = validatePathWithinRoot(this.projectRoot, filePath);
+    if (!fullPath) return [];
+    try {
+      const content = fs.readFileSync(fullPath, 'utf-8');
+      return [...new Set(extractReExports(content, language).map((r) => r.source))];
+    } catch (error) {
+      logDebug('Failed to read file for re-exports', { filePath, error: String(error) });
+      return [];
+    }
   }
 
   /**

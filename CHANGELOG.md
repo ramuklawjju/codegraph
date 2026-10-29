@@ -14,7 +14,11 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   chain of calls/references between two symbols, one hop per line with
   `file:line` and edge kind. If nothing connects A to B it checks B to A, so you
   learn which way the flow runs. Replaces chains of `codegraph_callees` calls
-  when tracing a flow.
+  when tracing a flow. Also available as `codegraph path <from> <to>`.
+- **`codegraph_dead_code` and `codegraph_cycles` MCP tools** (and
+  `codegraph dead-code` / `codegraph cycles` CLI commands): list functions,
+  methods and classes nothing refers to, and groups of files that depend on
+  each other in a cycle. Both take a directory filter.
 - **Lua**: CodeGraph now indexes Lua (`.lua`) — functions, methods (table `t.f`
   and `t:m` definitions become methods with a `t::f` receiver-qualified name),
   local variables, `require(...)` imports, and the call edges between them.
@@ -27,6 +31,30 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   imports.
 
 ### Fixed
+- **Method calls on typed variables now resolve**: calls like `cg.findPath()`
+  where `cg: CodeGraph`, `cg = new CodeGraph()`, `CodeGraph cg = ...` or
+  `cg = this.getCodeGraph()` (using that function's declared return type) now
+  link to the right class's method instead of being dropped or guessed. Callers,
+  callees, impact and path results gain these edges. Re-index to pick them up.
+- **Fewer wrong call edges to same-named project symbols**: library calls such
+  as `db.prepare(sql).run()`, `regex.exec()`, `fs.watch()` or calls through a
+  typed interface no longer get linked to an unrelated project function or
+  method that happens to share the name (e.g. a `run()` in a test helper).
+- **`codegraph affected` and file dependency queries missed most dependents**:
+  they only followed raw `imports` edges, but resolved imports are stored as
+  call/reference edges, and test files (whose calls sit inside `describe()`
+  callbacks) and re-export barrels recorded no cross-file links at all. So in
+  TypeScript projects most dependent files and their tests were never
+  reported. They now follow every cross-file edge plus each file's resolved
+  imports and re-exports.
+- **Circular dependency detection returned nothing and could miss cycles**: it
+  had the same dependency bug, and its DFS skipped cycles reached through an
+  already-visited file. It now reports every cycle once, grouped by the files
+  involved.
+- **Dead code detection was mostly false positives**: functions passed as
+  callbacks, object-literal methods, public methods of exported classes,
+  overrides, decorated symbols, entry points and test files are no longer
+  reported.
 - **Claude Code permission prompts for `codegraph_explore` and `codegraph_files`**:
   `codegraph install` now pre-approves these (and the new `codegraph_path`) in
   Claude's `settings.json`. Re-run `codegraph install` to pick them up.

@@ -19,6 +19,18 @@ const PATH_EDGE_KINDS = new Set<EdgeKind>([
   'contains', 'calls', 'imports', 'exports', 'extends', 'implements', 'references',
   'type_of', 'returns', 'instantiates', 'overrides', 'decorates',
 ]);
+const DEAD_CODE_KINDS = new Set<NodeKind>([
+  'function', 'method', 'class', 'struct', 'interface', 'trait', 'protocol',
+  'enum', 'type_alias', 'variable', 'constant', 'property', 'field',
+]);
+
+/** Normalize a directory filter (`./src/`, `src`) to a `src/` prefix, or null. */
+function normalizeDirFilter(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim().replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
+  return trimmed && trimmed !== '.' ? `${trimmed}/` : null;
+}
+
 /** Cap on same-named endpoint candidates per side, bounding BFS runs to N*N. */
 const MAX_PATH_ENDPOINTS = 5;
 
@@ -391,6 +403,49 @@ export const tools: ToolDefinition[] = [
     },
   },
   {
+    name: 'codegraph_dead_code',
+    description: 'List functions/methods/classes that nothing in the index refers to — candidates for deletion during cleanup. Skips exported symbols, public members of exported types, decorated symbols, overrides, entry points, and test files. Results are candidates, not proof: reflection, dynamic dispatch, and string-based lookups are invisible to static analysis.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'Only report symbols in files under this directory (e.g., "src/utils")',
+        },
+        kinds: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Node kinds to check (default: function, method, class)',
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum number of symbols to return (default: 50)',
+          default: 50,
+        },
+        projectPath: projectPathProperty,
+      },
+    },
+  },
+  {
+    name: 'codegraph_cycles',
+    description: 'Find circular file dependencies. Each result is a group of files that depend on each other through a cycle of imports/calls/references. Use before refactoring module boundaries or when chasing import-order bugs.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'Only report cycles that include a file under this directory',
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum number of cycles to return (default: 20)',
+          default: 20,
+        },
+        projectPath: projectPathProperty,
+      },
+    },
+  },
+  {
     name: 'codegraph_node',
     description: 'Get detailed info about ONE symbol (location, signature, docstring). Pass includeCode=true for source: a function/method returns its body; a class/interface/struct/enum returns a compact member OUTLINE (fields + method signatures + line numbers), not every method body — Read or codegraph_node a specific member for its body. Keep includeCode=false to minimize context. For SEVERAL related symbols, make ONE codegraph_explore (or codegraph_context) call instead of many node calls — repeated node calls each re-read the whole context and cost far more.',
     inputSchema: {
@@ -633,6 +688,10 @@ export class ToolHandler {
           return await this.handleExplore(args);
         case 'codegraph_path':
           return await this.handlePath(args);
+        case 'codegraph_dead_code':
+          return await this.handleDeadCode(args);
+        case 'codegraph_cycles':
+          return await this.handleCycles(args);
         case 'codegraph_node':
           return await this.handleNode(args);
         case 'codegraph_status':
@@ -825,6 +884,55 @@ export class ToolHandler {
       `No path between "${from}" and "${to}" in either direction (edge kinds: ${edgeKinds.join(', ')}). ` +
       `They may be connected only through dynamic dispatch, config, or code outside the index.`
     );
+  }
+
+  /**
+   * Handle codegraph_dead_code
+   */
+  private async handleDeadCode(args: Record<string, unknown>): Promise<ToolResult> {
+    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const limit = clamp((args.limit as number) || 50, 1, 500);
+    const prefix = normalizeDirFilter(args.path);
+    const kinds = Array.isArray(args.kinds)
+      ? (args.kinds as unknown[]).filter((k): k is NodeKind => typeof k === 'string' && DEAD_CODE_KINDS.has(k as NodeKind))
+      : [];
+
+    const dead = cg
+      .findDeadCode(kinds.length > 0 ? kinds : undefined)
+      .filter((n) => !prefix || n.filePath.startsWith(prefix))
+      .sort((a, b) => a.filePath.localeCompare(b.filePath) || a.startLine - b.startLine);
+
+    if (dead.length === 0) {
+      return this.textResult(`No unreferenced symbols found${prefix ? ` under ${prefix}` : ''}.`);
+    }
+    const lines = [`## Unreferenced symbols (${dead.length} found${dead.length > limit ? `, showing ${limit}` : ''})`, ''];
+    for (const n of dead.slice(0, limit)) {
+      lines.push(`- ${n.name} (${n.kind}) - ${n.filePath}:${n.startLine}`);
+    }
+    lines.push('', '> Candidates only: confirm before deleting if the code may be reached by reflection, dynamic dispatch, or string lookup.');
+    return this.textResult(this.truncateOutput(lines.join('\n')));
+  }
+
+  /**
+   * Handle codegraph_cycles
+   */
+  private async handleCycles(args: Record<string, unknown>): Promise<ToolResult> {
+    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const limit = clamp((args.limit as number) || 20, 1, 200);
+    const prefix = normalizeDirFilter(args.path);
+
+    const cycles = cg
+      .findCircularDependencies()
+      .filter((c) => !prefix || c.some((f) => f.startsWith(prefix)));
+
+    if (cycles.length === 0) {
+      return this.textResult(`No circular file dependencies found${prefix ? ` involving ${prefix}` : ''}.`);
+    }
+    const lines = [`## Circular dependencies (${cycles.length} group${cycles.length === 1 ? '' : 's'})`, ''];
+    cycles.slice(0, limit).forEach((group, i) => {
+      lines.push(`${i + 1}. ${group.length} files: ${group.join(', ')}`);
+    });
+    return this.textResult(this.truncateOutput(lines.join('\n')));
   }
 
   private formatPath(path: Array<{ node: Node; edge: Edge | null }>, title: string): string {

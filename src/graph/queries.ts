@@ -7,6 +7,48 @@
 import { Node, Edge, Context, Subgraph, EdgeKind } from '../types';
 import { QueryBuilder } from '../db/queries';
 import { GraphTraverser } from './traversal';
+import { isTestFile } from '../search/query-utils';
+import type { Language } from '../types';
+
+/** Resolves file-level imports for the dependency graph. */
+export interface ImportFileResolver {
+  /** Project file an import specifier in `fromFile` loads, or null. */
+  resolve(specifier: string, fromFile: string, language: Language): string | null;
+  /** Specifiers `filePath` re-exports from; these create no import node. */
+  reExportSpecifiers(filePath: string, language: Language): string[];
+}
+
+const RE_EXPORT_LANGUAGES = new Set<Language>(['typescript', 'javascript', 'tsx', 'jsx']);
+
+/** Names invoked by a runtime or framework rather than by user code. */
+const ENTRY_POINT_NAMES = new Set([
+  'main', 'constructor', 'init', '__init__', '__new__', '__call__', '__enter__', '__exit__',
+  'setUp', 'tearDown', 'toString', 'equals', 'hashCode', 'render', 'new', 'drop', 'fmt',
+]);
+
+function wordPattern(name: string): RegExp {
+  return new RegExp(`(^|[^A-Za-z0-9_$])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}($|[^A-Za-z0-9_$])`);
+}
+
+/** True when `node.name` appears as a whole word in its file outside the node's own span. */
+function nameUsedOutsideNode(node: Node, lines: string[]): boolean {
+  const word = wordPattern(node.name);
+  for (let i = 0; i < lines.length; i++) {
+    const lineNo = i + 1;
+    if (lineNo >= node.startLine && lineNo <= node.endLine) continue;
+    if (word.test(lines[i]!)) return true;
+  }
+  return false;
+}
+
+/** True when `name` appears as a whole word within lines `start..end` (1-based, inclusive). */
+function nameInSpan(name: string, lines: string[], start: number, end: number): boolean {
+  const word = wordPattern(name);
+  for (let i = Math.max(0, start - 1); i < Math.min(lines.length, end); i++) {
+    if (word.test(lines[i]!)) return true;
+  }
+  return false;
+}
 
 /**
  * Graph query manager for complex queries
@@ -14,6 +56,54 @@ import { GraphTraverser } from './traversal';
 export class GraphQueryManager {
   private queries: QueryBuilder;
   private traverser: GraphTraverser;
+
+  private importResolver: ImportFileResolver | null = null;
+  private importGraph: { fingerprint: string; forward: Map<string, Set<string>>; reverse: Map<string, Set<string>> } | null = null;
+
+  /**
+   * Supply a resolver for import specifiers. Import nodes store the module
+   * path (`../src/index`) but no edge to the file it loads, and code inside
+   * anonymous callbacks (e.g. `describe(() => ...)` test bodies) records no
+   * symbol edges — so without this, such files look dependency-free.
+   */
+  setImportResolver(resolver: ImportFileResolver): void {
+    this.importResolver = resolver;
+    this.importGraph = null;
+  }
+
+  /** File-level import graph, rebuilt only when import nodes or files change. */
+  private getImportGraph(): { forward: Map<string, Set<string>>; reverse: Map<string, Set<string>> } | null {
+    if (!this.importResolver) return null;
+    const fingerprint = this.queries.getImportFingerprint();
+    if (this.importGraph?.fingerprint === fingerprint) return this.importGraph;
+
+    const indexed = new Set(this.queries.getAllFilePaths());
+    const forward = new Map<string, Set<string>>();
+    const reverse = new Map<string, Set<string>>();
+    const resolved = new Map<string, string | null>();
+    const specifiers = this.queries.getImportSpecifiers();
+    for (const file of this.queries.getAllFiles()) {
+      if (!RE_EXPORT_LANGUAGES.has(file.language)) continue;
+      for (const name of this.importResolver.reExportSpecifiers(file.path, file.language)) {
+        specifiers.push({ filePath: file.path, name, language: file.language });
+      }
+    }
+    for (const imp of specifiers) {
+      const key = `${imp.language}\0${imp.filePath}\0${imp.name}`;
+      let target = resolved.get(key);
+      if (target === undefined) {
+        target = this.importResolver.resolve(imp.name, imp.filePath, imp.language);
+        resolved.set(key, target);
+      }
+      if (!target || target === imp.filePath || !indexed.has(target)) continue;
+      if (!forward.has(imp.filePath)) forward.set(imp.filePath, new Set());
+      forward.get(imp.filePath)!.add(target);
+      if (!reverse.has(target)) reverse.set(target, new Set());
+      reverse.get(target)!.add(imp.filePath);
+    }
+    this.importGraph = { fingerprint, forward, reverse };
+    return this.importGraph;
+  }
 
   constructor(queries: QueryBuilder) {
     this.queries = queries;
@@ -116,24 +206,9 @@ export class GraphQueryManager {
    * @returns Array of file paths this file depends on
    */
   getFileDependencies(filePath: string): string[] {
-    const nodes = this.queries.getNodesByFile(filePath);
-    const fileNode = nodes.find((n) => n.kind === 'file');
-
-    if (!fileNode) {
-      return [];
-    }
-
-    const dependencies = new Set<string>();
-    const importEdges = this.queries.getOutgoingEdges(fileNode.id, ['imports']);
-
-    for (const edge of importEdges) {
-      const targetNode = this.queries.getNodeById(edge.target);
-      if (targetNode && targetNode.filePath !== filePath) {
-        dependencies.add(targetNode.filePath);
-      }
-    }
-
-    return Array.from(dependencies);
+    const deps = new Set(this.queries.getFileDependencyPaths(filePath));
+    for (const f of this.getImportGraph()?.forward.get(filePath) ?? []) deps.add(f);
+    return Array.from(deps);
   }
 
   /**
@@ -145,34 +220,8 @@ export class GraphQueryManager {
    * @returns Array of file paths that depend on this file
    */
   getFileDependents(filePath: string): string[] {
-    const nodes = this.queries.getNodesByFile(filePath);
-    const dependents = new Set<string>();
-
-    // Check file-level incoming import edges (file:X imports file:Y)
-    const fileNode = nodes.find((n) => n.kind === 'file');
-    if (fileNode) {
-      const incomingFileEdges = this.queries.getIncomingEdges(fileNode.id, ['imports']);
-      for (const edge of incomingFileEdges) {
-        const sourceNode = this.queries.getNodeById(edge.source);
-        if (sourceNode && sourceNode.filePath !== filePath) {
-          dependents.add(sourceNode.filePath);
-        }
-      }
-    }
-
-    // Also check node-level imports of exported symbols
-    for (const node of nodes) {
-      if (node.isExported) {
-        const incomingEdges = this.queries.getIncomingEdges(node.id, ['imports']);
-        for (const edge of incomingEdges) {
-          const sourceNode = this.queries.getNodeById(edge.source);
-          if (sourceNode && sourceNode.filePath !== filePath) {
-            dependents.add(sourceNode.filePath);
-          }
-        }
-      }
-    }
-
+    const dependents = new Set(this.queries.getFileDependentPaths(filePath));
+    for (const f of this.getImportGraph()?.reverse.get(filePath) ?? []) dependents.add(f);
     return Array.from(dependents);
   }
 
@@ -252,48 +301,72 @@ export class GraphQueryManager {
   }
 
   /**
-   * Find circular dependencies in the graph
+   * Find circular file dependencies.
    *
-   * @returns Array of cycles, each cycle is an array of node IDs
+   * Uses Tarjan's strongly connected components, so every file caught in a
+   * cycle is reported exactly once, grouped with the files it cycles with.
+   * (A plain DFS with a shared visited set misses cycles reached through an
+   * already-visited file.) Each group is sorted; groups are largest first.
+   *
+   * @returns Array of cycles, each cycle is an array of file paths
    */
   findCircularDependencies(): string[][] {
-    const files = this.queries.getAllFiles();
-    const cycles: string[][] = [];
-    const visited = new Set<string>();
-    const recursionStack = new Set<string>();
-
-    const dfs = (filePath: string, path: string[]): void => {
-      if (recursionStack.has(filePath)) {
-        // Found a cycle
-        const cycleStart = path.indexOf(filePath);
-        if (cycleStart !== -1) {
-          cycles.push(path.slice(cycleStart));
-        }
-        return;
-      }
-
-      if (visited.has(filePath)) {
-        return;
-      }
-
-      visited.add(filePath);
-      recursionStack.add(filePath);
-
-      const dependencies = this.getFileDependencies(filePath);
-      for (const dep of dependencies) {
-        dfs(dep, [...path, filePath]);
-      }
-
-      recursionStack.delete(filePath);
+    const adjacency = new Map<string, string[]>();
+    const addEdge = (from: string, to: string) => {
+      const list = adjacency.get(from);
+      if (list) list.push(to);
+      else adjacency.set(from, [to]);
     };
+    for (const { from, to } of this.queries.getAllFileDependencyPairs()) addEdge(from, to);
+    for (const [from, targets] of this.getImportGraph()?.forward ?? []) {
+      for (const to of targets) addEdge(from, to);
+    }
 
-    for (const file of files) {
-      if (!visited.has(file.path)) {
-        dfs(file.path, []);
+    const index = new Map<string, number>();
+    const low = new Map<string, number>();
+    const onStack = new Set<string>();
+    const stack: string[] = [];
+    const cycles: string[][] = [];
+    let counter = 0;
+
+    // Iterative Tarjan: deep import chains would overflow the JS call stack.
+    for (const root of adjacency.keys()) {
+      if (index.has(root)) continue;
+      const work: Array<{ node: string; next: number }> = [{ node: root, next: 0 }];
+      index.set(root, counter); low.set(root, counter); counter++;
+      stack.push(root); onStack.add(root);
+
+      while (work.length > 0) {
+        const frame = work[work.length - 1]!;
+        const deps = adjacency.get(frame.node) ?? [];
+        if (frame.next < deps.length) {
+          const dep = deps[frame.next++]!;
+          if (!index.has(dep)) {
+            index.set(dep, counter); low.set(dep, counter); counter++;
+            stack.push(dep); onStack.add(dep);
+            work.push({ node: dep, next: 0 });
+          } else if (onStack.has(dep)) {
+            low.set(frame.node, Math.min(low.get(frame.node)!, index.get(dep)!));
+          }
+          continue;
+        }
+        work.pop();
+        const parent = work[work.length - 1];
+        if (parent) low.set(parent.node, Math.min(low.get(parent.node)!, low.get(frame.node)!));
+        if (low.get(frame.node) === index.get(frame.node)) {
+          const group: string[] = [];
+          let member: string;
+          do {
+            member = stack.pop()!;
+            onStack.delete(member);
+            group.push(member);
+          } while (member !== frame.node);
+          if (group.length > 1) cycles.push(group.sort());
+        }
       }
     }
 
-    return cycles;
+    return cycles.sort((x, y) => y.length - x.length || x[0]!.localeCompare(y[0]!));
   }
 
   /**
@@ -330,35 +403,99 @@ export class GraphQueryManager {
   }
 
   /**
-   * Find dead code (nodes with no incoming references)
+   * Find dead code: symbols nothing in the index refers to.
+   *
+   * Skips symbols that are reachable from outside the graph's view: exported
+   * symbols, public members of exported types, decorated symbols (frameworks
+   * call them), methods that override/implement another or that a supertype
+   * declares (called through the parent type), object-literal members,
+   * constructors and conventional entry points, and anything in test files.
+   * When `readFile` is given, a symbol whose name still appears
+   * elsewhere in its own file is also kept — this catches references the
+   * extractor does not record as edges, such as a function passed as a
+   * callback (`items.map(serialize)`).
    *
    * @param kinds - Node kinds to check (default: functions, methods, classes)
+   * @param readFile - Optional reader returning a file's source, or null
    * @returns Array of unreferenced nodes
    */
-  findDeadCode(kinds?: Node['kind'][]): Node[] {
+  findDeadCode(kinds?: Node['kind'][], readFile?: (filePath: string) => string | null): Node[] {
     const targetKinds = kinds || ['function', 'method', 'class'];
     const deadCode: Node[] = [];
+    const fileLines = new Map<string, string[] | null>();
+    const getLines = (filePath: string): string[] | null => {
+      if (!readFile) return null;
+      if (!fileLines.has(filePath)) {
+        const content = readFile(filePath);
+        fileLines.set(filePath, content === null ? null : content.split('\n'));
+      }
+      return fileLines.get(filePath)!;
+    };
 
     for (const kind of targetKinds) {
       const nodes = this.queries.getNodesByKind(kind);
       for (const node of nodes) {
-        // Skip exported symbols (they may be used externally)
-        if (node.isExported) {
-          continue;
-        }
+        if (node.isExported) continue;
+        if (ENTRY_POINT_NAMES.has(node.name)) continue;
+        if (node.decorators && node.decorators.length > 0) continue;
+        if (isTestFile(node.filePath)) continue;
 
         const incomingEdges = this.queries.getIncomingEdges(node.id);
+        if (incomingEdges.some((e) => e.kind !== 'contains')) continue;
 
-        // Filter out containment edges
-        const references = incomingEdges.filter((e) => e.kind !== 'contains');
-
-        if (references.length === 0) {
-          deadCode.push(node);
+        if (node.kind === 'method' || node.kind === 'property' || node.kind === 'field') {
+          if (this.queries.getOutgoingEdges(node.id, ['overrides', 'implements']).length > 0) continue;
+          const parent = incomingEdges
+            .filter((e) => e.kind === 'contains')
+            .map((e) => this.queries.getNodeById(e.source))
+            .find((p) => p && p.kind !== 'file');
+          // No owning type: an object-literal member, invoked through the
+          // object (often an interface implementation) rather than by name.
+          if (!parent) continue;
+          if (parent.isExported && node.visibility !== 'private') continue;
+          if (this.declaredBySupertype(parent, node.name, getLines)) continue;
         }
+
+        const lines = getLines(node.filePath);
+        if (lines && nameUsedOutsideNode(node, lines)) continue;
+
+        deadCode.push(node);
       }
     }
 
     return deadCode;
+  }
+
+  /**
+   * True when a type `parent` extends/implements declares a member `name` —
+   * the member is then called through the supertype, not by its own name.
+   */
+  private declaredBySupertype(
+    parent: Node,
+    name: string,
+    getLines: (filePath: string) => string[] | null
+  ): boolean {
+    const seen = new Set<string>([parent.id]);
+    const queue = [parent];
+    while (queue.length > 0) {
+      const type = queue.shift()!;
+      for (const edge of this.queries.getOutgoingEdges(type.id, ['extends', 'implements'])) {
+        if (seen.has(edge.target)) continue;
+        seen.add(edge.target);
+        const superType = this.queries.getNodeById(edge.target);
+        if (!superType) continue;
+        const declares = this.queries
+          .getOutgoingEdges(superType.id, ['contains'])
+          .some((e) => this.queries.getNodeById(e.target)?.name === name);
+        if (declares) return true;
+        // Some extractors don't emit interface members as nodes; fall back
+        // to the supertype's own source span.
+        const lines = getLines(superType.filePath);
+        if (lines && nameInSpan(name, lines, superType.startLine, superType.endLine)) return true;
+        queue.push(superType);
+      }
+    }
+    return false;
   }
 
   /**

@@ -40,6 +40,8 @@ export function getCodeGraphPermissions(): string[] {
     'mcp__codegraph__codegraph_node',
     'mcp__codegraph__codegraph_explore',
     'mcp__codegraph__codegraph_files',
+    'mcp__codegraph__codegraph_dead_code',
+    'mcp__codegraph__codegraph_cycles',
     'mcp__codegraph__codegraph_status',
   ];
 }
